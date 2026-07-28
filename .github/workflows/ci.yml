@@ -39,6 +39,21 @@ jobs:
       - name: CDK synth (validate templates)
         run: |
           npm install -g aws-cdk@2.1128.1
+          # The VPCs are defined with max_azs, which makes the CDK look up the
+          # account's availability zones. That lookup needs AWS credentials,
+          # which CI does not have, so seed the cached context instead. These
+          # values are only used to synthesize; a real deploy overwrites them
+          # with the zones actually available in the target account.
+          cat > cdk.context.json <<'CTX'
+          {
+            "availability-zones:account=123456789012:region=us-east-1": [
+              "us-east-1a", "us-east-1b", "us-east-1c"
+            ],
+            "availability-zones:account=123456789012:region=us-west-2": [
+              "us-west-2a", "us-west-2b", "us-west-2c"
+            ]
+          }
+          CTX
           cdk synth --quiet
         env:
           CDK_DEFAULT_ACCOUNT: "123456789012"
