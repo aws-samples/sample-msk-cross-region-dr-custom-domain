@@ -1,0 +1,27 @@
+[project]
+name = "amazon-msk-dr-cross-region-custom-domain"
+version = "1.0.0"
+description = "Cross-region MSK disaster recovery with a custom domain and Route 53 ARC"
+requires-python = ">=3.9"
+license = {text = "MIT-0"}
+authors = [
+    {name = "Amazon Web Services"},
+]
+readme = "README.md"
+dependencies = [
+    "aws-cdk-lib==2.260.0",
+    "constructs==10.6.0",
+    "cdk-nag==2.38.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
