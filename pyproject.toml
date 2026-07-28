@@ -2,7 +2,7 @@
 name = "amazon-msk-dr-cross-region-custom-domain"
 version = "1.0.0"
 description = "Cross-region MSK disaster recovery with a custom domain and Route 53 ARC"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT-0"}
 authors = [
     {name = "Amazon Web Services"},

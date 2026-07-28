@@ -176,7 +176,7 @@ Python. `app.py` defines 10 stacks; cross-Region references are resolved with
 - **AWS CDK CLI 2.1128.1 or later.** The synthesized cloud assembly uses schema 54;
   older CLIs fail with a "Cloud assembly schema version mismatch" error. Check with
   `cdk --version`.
-- **Python 3** with the sample's dependencies:
+- **Python 3.10 or later** with the sample's dependencies:
   ```bash
   pip install -r requirements.txt
   ```
