@@ -67,10 +67,10 @@ already trusts Amazon's public CA for the direct broker connections). This follo
 the bootstrap-only pattern in the AWS Big Data Blog post cited above. For a domain
 you own, request a public ACM certificate instead and skip the self-signed step.
 
-By default, AWS Application Recovery Controller (ARC) routing controls drive
-failover: an operator flips a single switch, and `bootstrap.<domain>` resolves to
-the standby Region's NLB. The `simulate_primary_failure.sh` script applies three
-levers together so the primary is genuinely cut off, not just DNS-repointed:
+AWS Application Recovery Controller (ARC) routing controls drive failover: an
+operator flips a single switch, and `bootstrap.<domain>` resolves to the standby
+Region's NLB. The `simulate_primary_failure.sh` script applies three levers
+together so the primary is genuinely cut off, not just DNS-repointed:
 
 1. **Set the ARC routing control `primary` to Off.** The Route 53
    `RECOVERY_CONTROL` health check backing the primary failover record goes
@@ -91,10 +91,14 @@ After failover, the client-to-broker path is cross-Region, so steady-state laten
 increases. This is inherent to regional DR. The `failback.sh` script reverses all
 three levers.
 
-You can deploy without ARC (`-c use_arc=false`) to use fully automatic failover
-driven by a `CLOUDWATCH_METRIC` health check on the primary NLB's
-`HealthyHostCount`. In that mode there is no ARC cluster and no ARC hourly cost,
-and levers 2 and 3 (which fail the NLB health check) trigger the flip.
+Failover is a deliberate operator action rather than a metric threshold. That is
+intentional for regional DR: a CloudWatch metric that would detect the event is
+published from the Region that is failing, so it may not be reliable at the moment
+you need it. The ARC routing control's data plane is highly available across five
+Regions, so the switch stays reachable during a regional event, and the Route 53
+failover records are pre-created, so no Route 53 control-plane call is needed at
+failover time. The trade-off is that nothing fails over until somebody, or your
+own automation, turns the control Off.
 
 ### Limitation: source isolation depends on the source Region's control plane
 
@@ -104,15 +108,37 @@ EC2 control-plane calls in the failing Region, so a genuine large-scale regional
 event can prevent them from completing. This is the same event you are failing away from.
 
 Failover itself does **not** depend on that: the routing decision is the ARC routing
-control or the Route 53 health check, and the failover records are pre-created, so
-clients re-bootstrap onto the standby regardless of whether source isolation
-succeeded. When isolation is skipped, the
-result is a *split-brain window* rather than a failed failover. Clients with an
+control, and the failover records are pre-created, so clients re-bootstrap onto the
+standby regardless of whether source isolation succeeded. When isolation is skipped,
+the result is a *split-brain window* rather than a failed failover. Clients with an
 established session to the primary can keep writing to it until those sessions break,
 and because replication is asynchronous those late writes join the stranded tail you
-reconcile at recovery. A network ACL entry is the method used here; other
-environments may isolate the source differently (for example, by changing Transit
-Gateway, VPC, or AWS Direct Connect routing).
+reconcile at recovery.
+
+If the isolation levers do not complete, you can still close that window from the
+client side:
+
+- **Restart the affected clients.** A client restart drops the established broker
+  sessions and forces a fresh bootstrap, which resolves to the standby. This does
+  not depend on the failing Region's control plane, and it is the most direct
+  remedy when you control the client fleet. In this code sample, `run_load.sh`
+  does the equivalent automatically: a watchdog polls `bootstrap.<domain>` and
+  restarts the Kafka client as soon as the active Region changes.
+- **Shorten how long a client can keep writing to the old primary.** Kafka client
+  settings such as `connections.max.idle.ms`, `request.timeout.ms`, and
+  `metadata.max.age.ms` bound how long a stale connection or cached broker list
+  survives, so clients give up on the old primary sooner.
+- **Isolate at a layer you can still reach.** A network ACL entry is the method
+  used here because it is stateless and drops in-flight packets. Other environments
+  may isolate the source differently, for example by changing Transit Gateway, VPC,
+  or AWS Direct Connect routing. Choose the method with your networking specialist,
+  based on which control planes your clients depend on.
+- **Make consumers idempotent.** Reprocessing is the expected outcome of a
+  split-brain window, so consumers that tolerate duplicate or replayed records
+  reduce the cost of reconciliation at recovery.
+
+Do not gate failover on isolation succeeding. Fail over first, then isolate on a
+best-effort basis.
 
 ### AWS services used
 
@@ -121,9 +147,9 @@ Gateway, VPC, or AWS Direct Connect routing).
 - **Amazon MSK Replicator**: cross-Region replication of topics and consumer
   offsets (primary to standby).
 - **Amazon Route 53**: private hosted zone with a failover record pair for
-  `bootstrap.<domain>`, plus the health check.
-- **AWS Application Recovery Controller (ARC)**: routing controls for
-  operator-driven failover (optional).
+  `bootstrap.<domain>`, plus the `RECOVERY_CONTROL` health check.
+- **AWS Application Recovery Controller (ARC)**: the routing control that drives
+  failover.
 - **AWS Transit Gateway**: one per Region, peered cross-Region, connecting the
   client and MSK VPCs.
 - **Elastic Load Balancing (Network Load Balancer)**: per-Region bootstrap
@@ -133,7 +159,6 @@ Gateway, VPC, or AWS Direct Connect routing).
 - **Amazon EC2** and **AWS Systems Manager (Session Manager)**: the Kafka client
   instance and shell access to it.
 - **Amazon VPC**: three non-overlapping VPCs (primary MSK, standby MSK, client).
-- **Amazon CloudWatch**: the metric alarm used in the non-ARC failover mode.
 
 The infrastructure is defined with the AWS Cloud Development Kit (AWS CDK) in
 Python. `app.py` defines 10 stacks; cross-Region references are resolved with
@@ -148,8 +173,8 @@ Python. `app.py` defines 10 stacks; cross-Region references are resolved with
 | `TgwDr` | Standby | Transit Gateway; attaches the standby MSK VPC. |
 | `TgwPeering` | Primary | Initiates the cross-Region TGW peering. |
 | `TgwPeeringAccepter` | Standby | Accepts the peering (custom resource). |
-| `MskRoutingControls` | Standby | ARC cluster, control panel, and the `primary` routing control. Omitted with `-c use_arc=false`. |
-| `MskDnsFailover` | Primary | Route 53 cross-Region private zone, failover record, alarm, and health check. |
+| `MskRoutingControls` | Standby | ARC cluster, control panel, and the `primary` routing control. |
+| `MskDnsFailover` | Primary | Route 53 cross-Region private zone, failover record pair, and the `RECOVERY_CONTROL` health check. |
 | `MskReplicator` | Standby | Cross-Region MSK Replicator (created in the target Region). |
 
 ## Prerequisites
@@ -163,7 +188,7 @@ Python. `app.py` defines 10 stacks; cross-Region references are resolved with
   logs), AWS Transit Gateway (including cross-Region peering), Amazon MSK and MSK
   Replicator, Elastic Load Balancing (Network Load Balancer), Amazon Route 53
   (private hosted zone, records, and health checks), AWS Application Recovery
-  Controller, AWS KMS, Amazon CloudWatch (alarms and log groups), AWS IAM (the
+  Controller, AWS KMS, Amazon CloudWatch Logs (VPC flow log groups), AWS IAM (the
   service roles the stacks create), Amazon EC2, AWS Certificate Manager (importing
   and deleting the bootstrap certificate), and AWS Systems Manager resources.
   The sample deploys with AWS CDK, which also uses AWS CloudFormation and an Amazon
@@ -194,7 +219,6 @@ any key with `-c <key>=<value>`.
 | `cluster_name` | `msk-xregion-dr-demo` | Base name for the clusters and ARC resources. |
 | `primary_region` | `us-east-1` | Primary Region. |
 | `dr_region` | `us-west-2` | Standby Region. |
-| `use_arc` | `true` | Set to `false` to use the CloudWatch-metric health check instead of ARC. |
 | `skip_nag` | *(unset)* | Set to skip the cdk-nag `AwsSolutionsChecks` aspect. |
 
 ## Deployment
@@ -212,7 +236,6 @@ idempotent, so it is safe to re-run after a partial failure.
 
 | Flag | Effect |
 |------|--------|
-| `--no-arc` | Deploy without ARC (alarm-only mode). |
 | `--account <ID>` | Override the target account (default: resolved from AWS STS). |
 | `--interactive` | Prompt for approval on each stack instead of `--require-approval never`. |
 
@@ -235,7 +258,7 @@ source certs/cert-arns.env
 CERT_CTX="-c primary_cert_arn=$PRIMARY_CERT_ARN -c dr_cert_arn=$DR_CERT_ARN"
 
 # 0b. ARC routing controls (standby Region). Deploy FIRST so the DNS + client stacks
-#    can reference the primary routing-control ARN. Skip with -c use_arc=false.
+#    can reference the primary routing-control ARN.
 cdk deploy MskRoutingControls $CERT_CTX
 #    New routing controls default to Off. Set the primary control On (steady
 #    state) BEFORE the DNS health check points at it, or DNS will read the
@@ -302,7 +325,7 @@ Open four panes on the client and run one command in each:
 # Pane 1 - continuous producer + consumer against the custom domain
 ./run_load.sh --mode both
 
-# Pane 2 - live failover dashboard (alarm / health check / which Region DNS points to)
+# Pane 2 - live failover dashboard (routing control / health check / which Region DNS points to)
 ./watch_failover.sh
 
 # Pane 3 - trigger the failover (ARC primary->Off + NACL DENY + SG revoke)
@@ -348,7 +371,7 @@ run on your workstation as part of `deploy.sh`.
 | Script | Purpose |
 |--------|---------|
 | `run_load.sh` | Runs a producer and/or consumer against `bootstrap.<domain>`. `--mode producer` emits one numbered message per second; `--mode consumer` prints messages with a running count; `--mode both` (default) runs both. |
-| `watch_failover.sh` | Dashboard: ARC routing-control state, primary NLB alarm, Route 53 health check, and which Region `bootstrap.<domain>` resolves to. |
+| `watch_failover.sh` | Dashboard: ARC routing-control state, Route 53 health check, and which Region `bootstrap.<domain>` resolves to. |
 | `simulate_primary_failure.sh` | Triggers failover with all three levers (ARC → Off, NACL DENY, SG revoke). |
 | `failback.sh` | Reverses all three levers and returns traffic to the primary. |
 | `set_routing_control.sh` | Reads (no args) or sets (`--state On\|Off`) the primary ARC routing control. |
@@ -372,9 +395,8 @@ active Region. This applies to IAM only, not to SASL/SCRAM.
 ## Cleanup
 
 This sample creates resources that incur hourly charges in *two* AWS Regions,
-including clusters that use Express brokers on Amazon MSK and (by default) an ARC
-cluster. Tear everything down
-when you finish to avoid ongoing charges.
+including clusters that use Express brokers on Amazon MSK and an ARC cluster. Tear
+everything down when you finish to avoid ongoing charges.
 
 ```bash
 ./destroy.sh            # prompts for confirmation

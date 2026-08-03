@@ -11,7 +11,8 @@ Topology (single account):
   - Transit Gateway in each region, peered cross-region, so the client reaches
     BOTH clusters' brokers directly after bootstrapping through the NLB.
   - Route 53 private zone on bootstrap.<domain> with a failover record pair that
-    flips the name from the primary NLB to the DR NLB on a health-check failure.
+    flips the name from the primary NLB to the DR NLB when an operator turns the
+    ARC `primary` routing control Off.
   - Cross-region MSK Replicator (primary -> DR), created in the DR region.
 
 Deploy order matters (see README). app.py only defines the stacks + wiring;
@@ -52,11 +53,6 @@ DR_REGION = app.node.try_get_context("dr_region") or "us-west-2"
 primary_cert_arn = app.node.try_get_context("primary_cert_arn")
 dr_cert_arn = app.node.try_get_context("dr_cert_arn")
 
-# Failover driver. ARC classic routing controls (operator-flipped, deterministic)
-# by default; set -c use_arc=false to fall back to the CloudWatch-metric health
-# check (automatic, no ARC cluster / no hourly ARC cost).
-use_arc = str(app.node.try_get_context("use_arc")).lower() != "false"
-
 # Non-overlapping CIDRs (mandatory for TGW routing).
 PRIMARY_MSK_CIDR = "10.0.0.0/16"
 DR_MSK_CIDR = "10.1.0.0/16"
@@ -93,22 +89,19 @@ dr_cluster = MskClusterStack(
 )
 
 # ── ARC routing controls (config plane lives in us-west-2) ────────────────
-# Optional operator-controlled failover switch. Deployed in the DR region
-# because ARC's recovery-control CONFIG plane is us-west-2. Its cluster carries
-# an hourly cost, so only created when use_arc (the default).
-routing_control = None
-primary_rc_arn = None
-arc_cluster_arn = None
-if use_arc:
-    routing_control = RoutingControlStack(
-        app, "MskRoutingControls",
-        env=dr_env,
-        cluster_name=cluster_name,
-        cross_region_references=True,
-        description="ARC cluster + routing controls for operator-driven failover (us-west-2)",
-    )
-    primary_rc_arn = routing_control.primary_routing_control_arn
-    arc_cluster_arn = routing_control.cluster_arn
+# The operator-controlled failover switch, and the only thing that drives the
+# Route 53 failover record. Deployed in the DR region because ARC's
+# recovery-control CONFIG plane is us-west-2. NOTE: the ARC cluster carries an
+# hourly cost for as long as it exists — see the README "Cleanup" section.
+routing_control = RoutingControlStack(
+    app, "MskRoutingControls",
+    env=dr_env,
+    cluster_name=cluster_name,
+    cross_region_references=True,
+    description="ARC cluster + routing controls for operator-driven failover (us-west-2)",
+)
+primary_rc_arn = routing_control.primary_routing_control_arn
+arc_cluster_arn = routing_control.cluster_arn
 
 # ── Client stack (separate VPC, primary region) ───────────────────────────
 client = ClientStack(
@@ -189,12 +182,11 @@ tgw_accept = TgwPeeringAccepterStack(
 )
 tgw_accept.add_dependency(tgw_peering)
 
-# ── Global DNS + automatic failover (primary region) ──────────────────────
+# ── Global DNS + operator-driven failover (primary region) ────────────────
 dns = DnsFailoverStack(
     app, "MskDnsFailover",
     env=primary_env,
     domain_name=domain_name,
-    cluster_name=cluster_name,
     associated_vpcs=[
         (client.vpc.vpc_id, PRIMARY_REGION),
         (primary_cluster.vpc.vpc_id, PRIMARY_REGION),
@@ -202,8 +194,6 @@ dns = DnsFailoverStack(
     ],
     primary_nlb_dns=primary_cluster.cluster_construct.nlb.load_balancer_dns_name,
     primary_nlb_canonical_zone_id=primary_cluster.cluster_construct.nlb.load_balancer_canonical_hosted_zone_id,
-    primary_nlb_full_name=primary_cluster.cluster_construct.nlb.load_balancer_full_name,
-    primary_target_group_full_name=primary_cluster.cluster_construct.target_group.target_group_full_name,
     dr_nlb_dns=dr_cluster.cluster_construct.nlb.load_balancer_dns_name,
     dr_nlb_canonical_zone_id=dr_cluster.cluster_construct.nlb.load_balancer_canonical_hosted_zone_id,
     primary_routing_control_arn=primary_rc_arn,
@@ -213,8 +203,7 @@ dns = DnsFailoverStack(
 dns.add_dependency(primary_cluster)
 dns.add_dependency(dr_cluster)
 dns.add_dependency(client)
-if routing_control is not None:
-    dns.add_dependency(routing_control)
+dns.add_dependency(routing_control)
 
 # ── Cross-region Replicator (DR/target region) ────────────────────────────
 replicator = ReplicatorStack(

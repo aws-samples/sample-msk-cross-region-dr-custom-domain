@@ -9,7 +9,7 @@ MSK clusters' brokers directly over Transit Gateway after bootstrapping through
 the custom domain.
 
 This stack only creates the VPC + client. The TGW attachment + routes are added
-by the networking stack; the broker endpoints / health-check / SG-lever values
+by the networking stack; the broker endpoints / routing-control / SG-lever values
 the demo scripts need are injected as env vars from values passed in by app.py.
 """
 
@@ -44,10 +44,10 @@ class ClientStack(Stack):
         dr_cluster_arn: str,
         primary_broker_sg_id: str,
         primary_msk_cidr: str,
-        # OPTIONAL ARC wiring (present when use_arc): the primary routing control
-        # the demo scripts flip, and its cluster (whose endpoints serve the flip).
-        primary_routing_control_arn: str | None = None,
-        arc_cluster_arn: str | None = None,
+        # ARC wiring: the primary routing control the demo scripts flip, and its
+        # cluster (whose regional endpoints serve the flip).
+        primary_routing_control_arn: str,
+        arc_cluster_arn: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -188,7 +188,6 @@ class ClientStack(Stack):
                 actions=[
                     "ec2:DescribeSecurityGroups",
                     "ec2:DescribeNetworkAcls",
-                    "cloudwatch:DescribeAlarms",
                     "route53:GetHealthCheckStatus",
                     "route53:ListResourceRecordSets",
                     "cloudformation:DescribeStacks",
@@ -221,40 +220,30 @@ class ClientStack(Stack):
                 ],
             )
         )
+        # ARC routing-control failover (lever 1): describe the cluster to find its
+        # endpoints, then flip the primary routing control On/Off via the cluster
+        # (recovery-cluster) data plane.
         client_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
-                actions=["cloudwatch:SetAlarmState"],
-                resources=[
-                    f"arn:aws:cloudwatch:{primary_region}:{Stack.of(self).account}:alarm:*",
+                actions=[
+                    "route53-recovery-control-config:DescribeCluster",
+                    "route53-recovery-control-config:DescribeRoutingControl",
                 ],
+                resources=[arc_cluster_arn, primary_routing_control_arn],
             )
         )
-        # ARC routing-control failover (lever 1): describe the cluster to find its
-        # endpoints, then flip the primary routing control On/Off via the cluster
-        # (recovery-cluster) data plane. Only granted when ARC is wired.
-        if primary_routing_control_arn:
-            client_role.add_to_policy(
-                iam.PolicyStatement(
-                    effect=iam.Effect.ALLOW,
-                    actions=[
-                        "route53-recovery-control-config:DescribeCluster",
-                        "route53-recovery-control-config:DescribeRoutingControl",
-                    ],
-                    resources=[arc_cluster_arn, primary_routing_control_arn],
-                )
+        client_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=[
+                    "route53-recovery-cluster:GetRoutingControlState",
+                    "route53-recovery-cluster:UpdateRoutingControlState",
+                    "route53-recovery-cluster:UpdateRoutingControlStates",
+                ],
+                resources=[primary_routing_control_arn],
             )
-            client_role.add_to_policy(
-                iam.PolicyStatement(
-                    effect=iam.Effect.ALLOW,
-                    actions=[
-                        "route53-recovery-cluster:GetRoutingControlState",
-                        "route53-recovery-cluster:UpdateRoutingControlState",
-                        "route53-recovery-cluster:UpdateRoutingControlStates",
-                    ],
-                    resources=[primary_routing_control_arn],
-                )
-            )
+        )
 
         # ── Demo scripts as an S3 asset, pulled at boot ──────────────────
         scripts_asset = s3_assets.Asset(
@@ -324,18 +313,16 @@ class ClientStack(Stack):
             # CIDRs failback.sh re-adds to the broker SG (both 9098 ingress rules).
             f'echo "export PRIMARY_MSK_CIDR={primary_msk_cidr}" >> /etc/profile.d/kafka.sh',
             f'echo "export CLIENT_CIDR={vpc_cidr}" >> /etc/profile.d/kafka.sh',
-            # The CloudWatch alarm + Route53 health-check live in the DNS stack
-            # (primary region). watch_failover.sh discovers them by stack name at
-            # runtime to avoid a circular stack dependency (the DNS stack already
-            # needs this client VPC's id for the private-zone association).
+            # The Route 53 health check lives in the DNS stack (primary region).
+            # watch_failover.sh discovers it by stack name at runtime to avoid a
+            # circular stack dependency (the DNS stack already needs this client
+            # VPC's id for the private-zone association).
             'echo "export DNS_STACK_NAME=MskDnsFailover" >> /etc/profile.d/kafka.sh',
-            # ARC routing-control ARNs (present only when use_arc). The failover
-            # scripts flip PRIMARY_ROUTING_CONTROL_ARN via ARC_CLUSTER_ARN's
-            # endpoints for a deterministic, operator-driven cutover.
-            *([
-                f'echo "export PRIMARY_ROUTING_CONTROL_ARN={primary_routing_control_arn}" >> /etc/profile.d/kafka.sh',
-                f'echo "export ARC_CLUSTER_ARN={arc_cluster_arn}" >> /etc/profile.d/kafka.sh',
-            ] if primary_routing_control_arn else []),
+            # ARC routing-control ARNs. The failover scripts flip
+            # PRIMARY_ROUTING_CONTROL_ARN via ARC_CLUSTER_ARN's endpoints for a
+            # deterministic, operator-driven cutover.
+            f'echo "export PRIMARY_ROUTING_CONTROL_ARN={primary_routing_control_arn}" >> /etc/profile.d/kafka.sh',
+            f'echo "export ARC_CLUSTER_ARN={arc_cluster_arn}" >> /etc/profile.d/kafka.sh',
             "",
             "# Fetch the demo scripts bundled as an S3 asset",
             f"aws s3 cp s3://{scripts_asset.s3_bucket_name}/{scripts_asset.s3_object_key} /tmp/scripts.zip --region {primary_region}",
@@ -415,7 +402,7 @@ class ClientStack(Stack):
                               "target registration need account-wide describe/list calls that "
                               "have no resource-level scoping (kafka:ListClusters, "
                               "elasticloadbalancing:Describe*, ec2:Describe*, cross-region "
-                              "route53/cloudwatch); (2) data-plane kafka-cluster:* actions use a "
+                              "route53); (2) data-plane kafka-cluster:* actions use a "
                               "topic/<cluster>/* and group/<cluster>/* wildcard so the client can "
                               "use any topic or consumer group within the two demo clusters.",
                 },

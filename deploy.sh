@@ -16,8 +16,7 @@
 #       cdk bootstrap aws://<ACCOUNT>/us-east-1 aws://<ACCOUNT>/us-west-2
 #
 # Usage:
-#   ./deploy.sh                         # deploy with ARC (default)
-#   ./deploy.sh --no-arc                # deploy without ARC (alarm-only mode)
+#   ./deploy.sh                         # deploy everything
 #   ./deploy.sh --account 123456789012  # override account (else uses STS)
 #
 # Teardown: ./destroy.sh (or see README "Clean up" section)
@@ -26,13 +25,11 @@ set -euo pipefail
 
 PRIMARY_REGION="${PRIMARY_REGION:-us-east-1}"
 DR_REGION="${DR_REGION:-us-west-2}"
-USE_ARC=true
 ACCOUNT=""
 _APPROVE="--require-approval never"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-arc) USE_ARC=false; shift ;;
         --account) ACCOUNT="$2"; shift 2 ;;
         --interactive) _APPROVE=""; shift ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -51,14 +48,10 @@ echo "============================================================"
 echo "  Account:        $ACCOUNT"
 echo "  Primary region: $PRIMARY_REGION"
 echo "  DR region:      $DR_REGION"
-echo "  ARC enabled:    $USE_ARC"
 echo "============================================================"
 echo ""
 
 _CDK_CONTEXT=""
-if [[ "$USE_ARC" == "false" ]]; then
-    _CDK_CONTEXT="-c use_arc=false"
-fi
 
 # ── Bootstrap TLS certificate ────────────────────────────────────────────────
 # The bootstrap NLB terminates TLS, so it needs an ACM certificate for
@@ -96,16 +89,17 @@ stack_output() {  # $1 = stack, $2 = key, $3 = region
         --output text 2>/dev/null || true
 }
 
-# ── Step 0: ARC routing controls (optional) ─────────────────────────────────
-if [[ "$USE_ARC" == "true" ]]; then
-    echo "[0/7] Deploying ARC routing controls (us-west-2)..."
-    cdk deploy MskRoutingControls $_APPROVE $_CDK_CONTEXT
-    echo "  Setting primary routing control to On (steady state)..."
-    scripts/set_routing_control.sh --state On \
-        --routing-control-arn "$(stack_output MskRoutingControls PrimaryRoutingControlArn "$DR_REGION")" \
-        --cluster-arn "$(stack_output MskRoutingControls ArcClusterArn "$DR_REGION")"
-    echo ""
-fi
+# ── Step 0: ARC routing controls ────────────────────────────────────────────
+# Deployed FIRST: the DNS and client stacks reference the primary routing-control
+# ARN. New routing controls default to Off, so set it On before the DNS health
+# check points at it, or DNS reads the primary as unhealthy and fails over at once.
+echo "[0/7] Deploying ARC routing controls (us-west-2)..."
+cdk deploy MskRoutingControls $_APPROVE $_CDK_CONTEXT
+echo "  Setting primary routing control to On (steady state)..."
+scripts/set_routing_control.sh --state On \
+    --routing-control-arn "$(stack_output MskRoutingControls PrimaryRoutingControlArn "$DR_REGION")" \
+    --cluster-arn "$(stack_output MskRoutingControls ArcClusterArn "$DR_REGION")"
+echo ""
 
 # ── Step 1: Clusters + Client ────────────────────────────────────────────────
 echo "[1/7] Deploying MSK clusters (both regions) + client VPC..."
@@ -207,6 +201,4 @@ echo "  ./simulate_primary_failure.sh      # pane 4 (triggers failover)"
 echo "  ./failback.sh                      # (restores primary)"
 echo ""
 echo "IMPORTANT: Destroy when done — see ./destroy.sh or README 'Clean up'."
-if [[ "$USE_ARC" == "true" ]]; then
-    echo "  The ARC cluster bills ~\$2/hr even when idle."
-fi
+echo "  The ARC cluster bills hourly even when idle."

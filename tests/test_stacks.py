@@ -31,6 +31,8 @@ PRIMARY_MSK_CIDR = "10.0.0.0/16"
 DR_MSK_CIDR = "10.1.0.0/16"
 CLIENT_CIDR = "10.2.0.0/16"
 CERT_ARN = f"arn:aws:acm:{PRIMARY_REGION}:{ACCOUNT}:certificate/test-cert"
+ARC_CLUSTER_ARN = f"arn:aws:route53-recovery-control::{ACCOUNT}:cluster/test-cluster"
+ROUTING_CONTROL_ARN = f"{ARC_CLUSTER_ARN}/routingcontrol/test-control"
 
 
 def _app():
@@ -143,13 +145,11 @@ def test_cluster_stack_nlb_falls_back_to_tcp_without_cert():
     )
 
 
-def test_dns_stack_failover_pair_and_healthcheck():
-    app = _app()
-    template = Template.from_stack(DnsFailoverStack(
+def _dns_stack(app):
+    return DnsFailoverStack(
         app, "MskDnsFailover",
         env=cdk.Environment(account=ACCOUNT, region=PRIMARY_REGION),
         domain_name=DOMAIN,
-        cluster_name=CLUSTER,
         associated_vpcs=[
             ("vpc-client", PRIMARY_REGION),
             ("vpc-primary", PRIMARY_REGION),
@@ -157,12 +157,16 @@ def test_dns_stack_failover_pair_and_healthcheck():
         ],
         primary_nlb_dns="primary-nlb.example.com",
         primary_nlb_canonical_zone_id="Z111",
-        primary_nlb_full_name="net/primary/abc",
-        primary_target_group_full_name="targetgroup/primary/def",
         dr_nlb_dns="dr-nlb.example.com",
         dr_nlb_canonical_zone_id="Z222",
+        primary_routing_control_arn=ROUTING_CONTROL_ARN,
         cross_region_references=True,
-    ))
+    )
+
+
+def test_dns_stack_failover_pair_and_healthcheck():
+    app = _app()
+    template = Template.from_stack(_dns_stack(app))
     # Private zone associated with three VPCs (cross-region).
     template.has_resource_properties(
         "AWS::Route53::HostedZone",
@@ -179,11 +183,21 @@ def test_dns_stack_failover_pair_and_healthcheck():
         {"Name": f"bootstrap.{DOMAIN}.", "Failover": "SECONDARY", "SetIdentifier": "secondary"},
     )
     template.resource_count_is("AWS::Route53::HealthCheck", 1)
+
+
+def test_dns_failover_is_driven_only_by_the_arc_routing_control():
+    """ARC is the only failover driver: the health check is RECOVERY_CONTROL bound
+    to the primary routing control, and no CloudWatch alarm is created."""
+    app = _app()
+    template = Template.from_stack(_dns_stack(app))
     template.has_resource_properties(
-        "AWS::CloudWatch::Alarm",
-        {"MetricName": "HealthyHostCount", "Namespace": "AWS/NetworkELB",
-         "ComparisonOperator": "LessThanThreshold", "Threshold": 1},
+        "AWS::Route53::HealthCheck",
+        {"HealthCheckConfig": Match.object_like({
+            "Type": "RECOVERY_CONTROL",
+            "RoutingControlArn": ROUTING_CONTROL_ARN,
+        })},
     )
+    template.resource_count_is("AWS::CloudWatch::Alarm", 0)
 
 
 def test_replicator_identical_topic_names_and_offsets():
@@ -227,6 +241,8 @@ def test_tgw_stack_creates_tgw_and_attachments():
         dr_cluster_arn=f"arn:aws:kafka:{DR_REGION}:{ACCOUNT}:cluster/d/uuid-2",
         primary_broker_sg_id=primary.cluster_construct.broker_sg.security_group_id,
         primary_msk_cidr=PRIMARY_MSK_CIDR,
+        primary_routing_control_arn=ROUTING_CONTROL_ARN,
+        arc_cluster_arn=ARC_CLUSTER_ARN,
         cross_region_references=True,
     )
     template = Template.from_stack(TransitGatewayStack(
@@ -274,6 +290,8 @@ def test_client_stack_one_instance_in_separate_vpc():
         dr_cluster_arn=f"arn:aws:kafka:{DR_REGION}:{ACCOUNT}:cluster/d/uuid-2",
         primary_broker_sg_id=primary.cluster_construct.broker_sg.security_group_id,
         primary_msk_cidr=PRIMARY_MSK_CIDR,
+        primary_routing_control_arn=ROUTING_CONTROL_ARN,
+        arc_cluster_arn=ARC_CLUSTER_ARN,
         cross_region_references=True,
     ))
     template.resource_count_is("AWS::EC2::Instance", 1)

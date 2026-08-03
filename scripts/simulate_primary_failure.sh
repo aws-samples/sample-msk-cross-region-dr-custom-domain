@@ -7,14 +7,13 @@
 # Three levers, applied together, to make the PRIMARY cluster genuinely
 # unreachable AND deterministically move traffic to DR:
 #
-#   1. ARC routing control primary -> Off  (ask #2)
+#   1. ARC routing control primary -> Off
 #        Flips the Route 53 RECOVERY_CONTROL health check backing the PRIMARY
-#        failover record. bootstrap.<domain> deterministically resolves to the
-#        DR NLB within seconds — an operator decision, not a wait on a metric
-#        alarm. (No-op if ARC is not wired; the SG/NACL levers alone still fail
-#        the NLB health check and drive the older alarm-based failover.)
+#        failover record. bootstrap.<domain> resolves to the DR NLB within
+#        seconds — an operator decision, not a wait on a metric alarm. This is
+#        what moves traffic; levers 2 and 3 only isolate the old primary.
 #
-#   2. NACL DENY tcp/9098 on the PRIMARY MSK subnets  (ask #1)
+#   2. NACL DENY tcp/9098 on the PRIMARY MSK subnets
 #        Network ACLs are STATELESS, so this drops in-flight packets, not just
 #        new connections. It severs the producer's ALREADY-ESTABLISHED direct
 #        broker connections over the Transit Gateway, forcing it off the primary
@@ -25,14 +24,14 @@
 #
 #   3. Revoke tcp/9098 ingress on the PRIMARY broker security group
 #        Kept for a faithful "the cluster is gone" picture: cleanly blocks new
-#        connections and is what failback.sh restores from env. Also fails the
-#        NLB health checks and cuts the cross-region replicator's link.
+#        connections and is what failback.sh restores from env. Also cuts the
+#        cross-region replicator's link.
 #
 # Fully reversible with failback.sh.
 #
 # Env (set by user-data in /etc/profile.d/kafka.sh); all overridable by flag:
 #   PRIMARY_BROKER_SG, PRIMARY_REGION,
-#   PRIMARY_ROUTING_CONTROL_ARN, ARC_CLUSTER_ARN  (ask #2; optional)
+#   PRIMARY_ROUTING_CONTROL_ARN, ARC_CLUSTER_ARN
 
 set -uo pipefail
 
@@ -67,23 +66,29 @@ if [[ -z "$SG" || -z "$REGION" ]]; then
     exit 1
 fi
 
+if [[ -z "$RC_ARN" || -z "$ARC_CLUSTER_ARN" ]]; then
+    echo "ERROR: need PRIMARY_ROUTING_CONTROL_ARN and ARC_CLUSTER_ARN — the routing" >&2
+    echo "       control is what moves traffic to DR. They are exported by user-data" >&2
+    echo "       in /etc/profile.d/kafka.sh; run 'bash -l', or pass" >&2
+    echo "       --routing-control-arn / --cluster-arn." >&2
+    exit 1
+fi
+
 # ── Lever 1: ARC routing control primary -> Off ───────────────────────────
-# Data-plane flip must target one of the cluster's 5 regional endpoints; we
+# The data-plane flip must target one of the cluster's 5 regional endpoints; we
 # discover them from the (control-plane) cluster description and try each until
-# one accepts the write. Best-effort: if ARC is not wired or all endpoints are
-# unreachable, we fall through to the SG/NACL levers, which still fail over via
-# the NLB health alarm.
+# one accepts the write. The ARC data plane is highly available across those 5
+# Regions, so the switch stays reachable even during a regional event.
 arc_set_state() {  # $1 = On|Off
     local desired="$1"
-    [[ -z "$RC_ARN" || -z "$ARC_CLUSTER_ARN" ]] && { echo "  (ARC not wired — skipping routing-control flip)"; return 0; }
 
     local endpoints
     endpoints=$(aws route53-recovery-control-config describe-cluster \
         --cluster-arn "$ARC_CLUSTER_ARN" --region us-west-2 \
         --query "Cluster.ClusterEndpoints[].[Region,Endpoint]" --output text 2>/dev/null || true)
     if [[ -z "$endpoints" ]]; then
-        echo "  WARN: could not describe ARC cluster; skipping routing-control flip." >&2
-        return 0
+        echo "  ERROR: could not describe the ARC cluster; cannot fail over." >&2
+        return 1
     fi
 
     while read -r ep_region ep_url; do
@@ -97,13 +102,14 @@ arc_set_state() {  # $1 = On|Off
         fi
     done <<< "$endpoints"
 
-    echo "  WARN: all ARC cluster endpoints rejected the flip; relying on SG/NACL + alarm." >&2
-    return 0
+    echo "  ERROR: all ARC cluster endpoints rejected the flip; cannot fail over." >&2
+    return 1
 }
 
 echo "Simulating PRIMARY failure ($REGION)..."
 echo "[1/3] ARC routing control primary -> Off (deterministic DNS failover)"
-arc_set_state Off
+# Fail loudly rather than isolating the primary with nowhere for traffic to go.
+arc_set_state Off || exit 1
 
 # ── Lever 2: stateless NACL DENY on the PRIMARY MSK subnets ────────────────
 # Discover the MSK VPC from the broker SG, then add a DENY entry to every NACL

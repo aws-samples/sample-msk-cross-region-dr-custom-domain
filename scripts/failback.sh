@@ -10,9 +10,7 @@
 #   3. ARC routing control primary -> On   (deterministic return to PRIMARY)
 #
 # Once the primary NLB targets are healthy again and the routing control is On,
-# bootstrap.<domain> resolves back to the PRIMARY NLB. If ARC is not wired, the
-# CloudWatch alarm path still restores PRIMARY once the NLB is healthy (we nudge
-# the alarm to OK to speed that up).
+# bootstrap.<domain> resolves back to the PRIMARY NLB.
 
 set -uo pipefail
 
@@ -21,7 +19,6 @@ REGION="${PRIMARY_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}"
 # CIDRs the broker SG admits on 9098 (defaults match the demo topology).
 MSK_CIDR="${PRIMARY_MSK_CIDR:-10.0.0.0/16}"
 CLIENT_CIDR="${CLIENT_CIDR:-10.2.0.0/16}"
-ALARM="${PRIMARY_HEALTH_ALARM:-}"
 RC_ARN="${PRIMARY_ROUTING_CONTROL_ARN:-}"
 ARC_CLUSTER_ARN="${ARC_CLUSTER_ARN:-}"
 NACL_RULE="${NACL_DENY_RULE_NUMBER:-90}"
@@ -87,64 +84,49 @@ else
 fi
 
 # ── Lever 1 reverse: ARC routing control primary -> On ─────────────────────
+# Wait for the primary NLB targets to come back first. Flipping the control On
+# while the brokers are still unreachable would point bootstrap.<domain> at a
+# primary that cannot serve a bootstrap request.
 echo "[3/3] ARC routing control primary -> On"
 if [[ -z "$RC_ARN" || -z "$ARC_CLUSTER_ARN" ]]; then
-    echo "  (ARC not wired — skipping routing-control flip)"
-else
-    endpoints=$(aws route53-recovery-control-config describe-cluster \
-        --cluster-arn "$ARC_CLUSTER_ARN" --region us-west-2 \
-        --query "Cluster.ClusterEndpoints[].[Region,Endpoint]" --output text 2>/dev/null || true)
-    flipped=0
-    while read -r ep_region ep_url; do
-        [[ -z "$ep_region" ]] && continue
-        if aws route53-recovery-cluster update-routing-control-state \
-            --routing-control-arn "$RC_ARN" \
-            --routing-control-state On \
-            --region "$ep_region" --endpoint-url "$ep_url" >/dev/null 2>&1; then
-            echo "  ARC routing control -> On (via $ep_region)"; flipped=1; break
-        fi
-    done <<< "$endpoints"
-    [[ "$flipped" == "0" ]] && echo "  WARN: could not flip routing control On; check ARC cluster." >&2
+    echo "ERROR: need PRIMARY_ROUTING_CONTROL_ARN and ARC_CLUSTER_ARN to fail back." >&2
+    echo "       They are exported by user-data in /etc/profile.d/kafka.sh; run 'bash -l'," >&2
+    echo "       or pass --routing-control-arn / --cluster-arn." >&2
+    exit 1
 fi
 
-# Discover the health alarm name from the DNS stack if not provided.
-if [[ -z "$ALARM" ]]; then
-    ALARM=$(aws cloudformation describe-stacks --region "$REGION" \
-        --stack-name "${DNS_STACK_NAME:-MskDnsFailover}" \
-        --query "Stacks[0].Outputs[?OutputKey=='PrimaryHealthAlarmName'].OutputValue" \
-        --output text 2>/dev/null || true)
-    [[ "$ALARM" == "None" ]] && ALARM=""
+PTG=$(aws cloudformation describe-stacks --region "$REGION" \
+    --stack-name "${PRIMARY_CLUSTER_STACK:-MskPrimaryCluster}" \
+    --query "Stacks[0].Outputs[?OutputKey=='TargetGroupArn'].OutputValue" \
+    --output text 2>/dev/null || true)
+if [[ -n "$PTG" && "$PTG" != "None" ]]; then
+    echo -n "  waiting for primary NLB targets to become healthy"
+    for _ in $(seq 1 18); do
+        healthy=$(aws elbv2 describe-target-health --region "$REGION" \
+            --target-group-arn "$PTG" \
+            --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+            --output text 2>/dev/null || echo 0)
+        [[ "$healthy" -ge 1 ]] && { echo " — healthy"; break; }
+        echo -n "."; sleep 10
+    done
 fi
 
-# Optional fast-path for the alarm-based (non-ARC) failover mode: nudge the alarm
-# to OK once the primary NLB targets are healthy, so DNS returns to PRIMARY
-# promptly instead of waiting out the evaluation window. Best-effort. With ARC
-# driving the health check this has no effect on routing (the RECOVERY_CONTROL
-# health check is state-based), but it keeps the alarm view tidy.
-if [[ -n "$ALARM" ]]; then
-    PTG=$(aws cloudformation describe-stacks --region "$REGION" \
-        --stack-name "${PRIMARY_CLUSTER_STACK:-MskPrimaryCluster}" \
-        --query "Stacks[0].Outputs[?OutputKey=='TargetGroupArn'].OutputValue" \
-        --output text 2>/dev/null || true)
-    if [[ -n "$PTG" && "$PTG" != "None" ]]; then
-        echo -n "  waiting for primary NLB targets to become healthy"
-        for _ in $(seq 1 18); do
-            healthy=$(aws elbv2 describe-target-health --region "$REGION" \
-                --target-group-arn "$PTG" \
-                --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
-                --output text 2>/dev/null || echo 0)
-            [[ "$healthy" -ge 1 ]] && { echo " — healthy"; break; }
-            echo -n "."; sleep 10
-        done
+endpoints=$(aws route53-recovery-control-config describe-cluster \
+    --cluster-arn "$ARC_CLUSTER_ARN" --region us-west-2 \
+    --query "Cluster.ClusterEndpoints[].[Region,Endpoint]" --output text 2>/dev/null || true)
+flipped=0
+while read -r ep_region ep_url; do
+    [[ -z "$ep_region" ]] && continue
+    if aws route53-recovery-cluster update-routing-control-state \
+        --routing-control-arn "$RC_ARN" \
+        --routing-control-state On \
+        --region "$ep_region" --endpoint-url "$ep_url" >/dev/null 2>&1; then
+        echo "  ARC routing control -> On (via $ep_region)"; flipped=1; break
     fi
-    if aws cloudwatch set-alarm-state --region "$REGION" \
-        --alarm-name "$ALARM" --state-value OK \
-        --state-reason "failback: primary brokers restored" >/dev/null 2>&1; then
-        echo "  nudged alarm '$ALARM' -> OK"
-    fi
-fi
+done <<< "$endpoints"
+[[ "$flipped" == "0" ]] && echo "  WARN: could not flip routing control On; check ARC cluster." >&2
 
 echo ""
-echo "PRIMARY restored. bootstrap.<domain> returns to the PRIMARY NLB once the"
-echo "routing control is On (ARC mode) or the health check is healthy (alarm mode)."
+echo "PRIMARY restored. bootstrap.<domain> returns to the PRIMARY NLB now that the"
+echo "routing control is On."
 echo "Watch with: ./watch_failover.sh"
